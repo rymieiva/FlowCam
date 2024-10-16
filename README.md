@@ -74,3 +74,18 @@ If you find our work useful in your research, please cite:
 
 ### Contact
 If you have any questions, please email Cameron Smith at omid.smith.cameron@gmail.com or open an issue.
+
+
+### Troubleshooting
+trying to run python run.py --help
+Installed flow vis with pip install flow-vis
+Installed flow-vis-torch with pip install git+https://github.com/ChristophReich1996/Optical-Flow-Visualization-PyTorch
+pip install piqa
+python -m pip install splines
+pip install git+https://github.com/patrick-kidger/torchcubicspline.git
+
+Attempting to run 
+python train.py --dataset kitti --vid_len 8 --batch_size 2 --name kitti_flowcam --n_skip 0
+
+Q: which Kitti dataset?
+raw_data is the one linked. For testing purposes, download whichever sequence from there. Rectified data is a safe choice

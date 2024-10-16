@@ -1,14 +1,10 @@
 """Code for pixelnerf and alternatives."""
-import torch, torchvision
+import torch
 from torch import nn
 from einops import rearrange, repeat
 from torch.nn import functional as F
 import numpy as np
-import time
-import timm
 from matplotlib import cm
-import kornia
-from tqdm import tqdm
 
 import conv_modules
 import mlp_modules
@@ -16,7 +12,8 @@ import geometry
 import renderer
 from geometry import procrustes
 
-ch_sec = lambda x: rearrange(x,"... c x y -> ... (x y) c")
+ch_sec = lambda x: rearrange(x, "... c x y -> ... (x y) c")
+
 ch_fst = lambda src,x=None:rearrange(src,"... (x y) c -> ... c x y",x=int(src.size(-2)**(.5)) if x is None else x)
 hom    = lambda x: torch.cat((x,torch.ones_like(x[...,[0]])),-1)
 

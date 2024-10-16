@@ -1,9 +1,7 @@
 # todo get rid of start import, just import run and access run.train_dataset, etc 
 from run import *
 
-train_dataset,val_dataset = get_dataset(),get_dataset(val=True,)
-train_dataset[0]
-train_dataloader,val_dataloader = get_dataloader(train_dataset),get_dataloader(val_dataset)
+
 
 def loss_fn(model_out, gt, model_input):
 
@@ -30,48 +28,56 @@ def loss_fn(model_out, gt, model_input):
 
     return losses
 
-model = torch.nn.DataParallel(model)
-
-# Train loop
-for step in trange(0 if args.eval else int(1e8), desc="Fitting"): # train until user interruption
-
-    # Run val set every n iterations
-    val_step = step>10 and step%150<10 
-    prefix = "val" if val_step else ""
-    torch.set_grad_enabled(not val_step)
-    if val_step: print("\n\n\nval step\n\n\n")
-
-    # Get data
-    try: model_input, ground_truth = next(train_dataloader if not val_step else val_dataloader)
-    except StopIteration:
-        if val_step: val_dataloader = get_dataloader(val_dataset)
-        else: train_dataloader = get_dataloader(train_dataset)
-        continue
-
-    model_input, ground_truth = to_gpu(model_input), to_gpu(ground_truth)
-
-    # Run model and calculate losses
-    total_loss = 0.
-    for loss_name, loss in loss_fn(model(model_input), ground_truth, model_input).items():
-        wandb.log({prefix+loss_name: loss.item()}, step=step)
-        total_loss += loss
-
-    wandb.log({prefix+"loss": total_loss.item()}, step=step)
-    wandb.log({"epoch": (step*args.batch_size)/len(train_dataset)}, step=step)
-
-    if not val_step: 
-        optim.zero_grad(); total_loss.backward(); optim.step();
-
-    # Image summaries and checkpoint
-    if step%50==0 : # write image summaries
-        print("writing summary")
-        with torch.no_grad(): model_output = model.module.render_full_img(model_input=model_input)
-        vis_scripts.wandb_summary( total_loss, model_output, model_input, ground_truth, None,prefix=prefix)
-    if step%100==0: #write video summaries
-        print("writing video summary")
-        try: vis_scripts.write_video(save_dir, vis_scripts.render_time_interp(model_input,model.module,None,16), prefix+"time_interp",step)
-        except Exception as e: print("error in writing video",e)
-    if step%500 == 0 and step: # save model
-        print(f"Saving to {save_dir}"); torch.save({ 'step': step, 'model_state_dict': model.module.state_dict(), }, os.path.join(save_dir, f"checkpoint_{step}.pt")) 
 
 
+
+if __name__ == '__main__':
+
+    train_dataset,val_dataset = get_dataset(),get_dataset(val=True,)
+    train_dataset[0]
+    train_dataloader,val_dataloader = get_dataloader(train_dataset),get_dataloader(val_dataset)
+
+    model = torch.nn.DataParallel(model)
+
+
+    # Train loop
+    for step in trange(0 if args.eval else int(1e8), desc="Fitting"): # train until user interruption
+
+        # Run val set every n iterations
+        val_step = step>10 and step%150<10 
+        prefix = "val" if val_step else ""
+        torch.set_grad_enabled(not val_step)
+        if val_step: print("\n\n\nval step\n\n\n")
+
+        # Get data
+        try: model_input, ground_truth = next(train_dataloader if not val_step else val_dataloader)
+        except StopIteration:
+            if val_step: val_dataloader = get_dataloader(val_dataset)
+            else: train_dataloader = get_dataloader(train_dataset)
+            continue
+
+        model_input, ground_truth = to_gpu(model_input), to_gpu(ground_truth)
+
+        # Run model and calculate losses
+        total_loss = 0.
+        for loss_name, loss in loss_fn(model(model_input), ground_truth, model_input).items():
+            wandb.log({prefix+loss_name: loss.item()}, step=step)
+            total_loss += loss
+
+        wandb.log({prefix+"loss": total_loss.item()}, step=step)
+        wandb.log({"epoch": (step*args.batch_size)/len(train_dataset)}, step=step)
+
+        if not val_step: 
+            optim.zero_grad(); total_loss.backward(); optim.step();
+
+        # Image summaries and checkpoint
+        if step%50==0 : # write image summaries
+            print("writing summary")
+            with torch.no_grad(): model_output = model.module.render_full_img(model_input=model_input)
+            vis_scripts.wandb_summary( total_loss, model_output, model_input, ground_truth, None,prefix=prefix)
+        if step%100==0: #write video summaries
+            print("writing video summary")
+            try: vis_scripts.write_video(save_dir, vis_scripts.render_time_interp(model_input,model.module,None,16), prefix+"time_interp",step)
+            except Exception as e: print("error in writing video",e)
+        if step%500 == 0 and step: # save model
+            print(f"Saving to {save_dir}"); torch.save({ 'step': step, 'model_state_dict': model.module.state_dict(), }, os.path.join(save_dir, f"checkpoint_{step}.pt")) 
