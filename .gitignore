@@ -1,4 +1,2 @@
-co3d_single
-cross_attention_renderer
-hydrant_flowcam
-wandb
+hydrant_flowcam/
+wandb/
