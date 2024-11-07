@@ -1,3 +1,4 @@
+# python eval.py -c "C:\Users\rymi\OneDrive - EIVA\Desktop\flowcam\co3d_hydrant.pt" --render_imgs --low_res 144 128 --n_skip 1 --save_imgs
 from run import *
 
 # Evaluation script
@@ -14,7 +15,22 @@ torch.set_grad_enabled(False)
 
 model.n_samples=128
 
-val_dataset = get_dataset(val=True,)
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+from data.flowcam_data import FlowCamDataset
+# Instantiation of FlowCamDataset in demo.py
+val_dataset = FlowCamDataset(
+    num_context=6,
+    n_skip=int(args.n_skip),           # Convert n_skip to integer explicitly
+    num_trgt=6,
+    low_res=args.low_res,
+    depth_scale=1,
+    val=True,
+    num_cat=1000,
+    overfit=False,
+    category="hydrant",                # Currently, only hydrant dataset available, set it to be the category
+    use_mask=False,
+    use_v1=True
+)
 
 for eval_idx,eval_dataset_idx in enumerate(tqdm(torch.linspace(0,len(val_dataset)-1,min(args.n_eval,len(val_dataset))).int())):
     model_input,ground_truth = val_dataset[eval_dataset_idx]
@@ -25,9 +41,9 @@ for eval_idx,eval_dataset_idx in enumerate(tqdm(torch.linspace(0,len(val_dataset
     model_out = model.render_full_img(model_input)
 
     # remove last frame since used as ctxt when n_ctxt=2
-    rgb_est,rgb_gt = [rearrange(img[:,:-1].clip(0,1),"b trgt (x y) c -> (b trgt) c x y",x=model_input["trgt_rgb"].size(-2)) 
-                                            for img in (model_out["fine_rgb" if "fine_rgb" in model_out else "rgb"],ground_truth["trgt_rgb"])]
-    depth_est = rearrange(model_out["depth"][:,:-1],"b trgt (x y) c -> (b trgt) c x y",x=model_input["trgt_rgb"].size(-2))
+    rgb_est,rgb_gt = [rearrange(img[:,:-1].clip(0,1),"b trgt (x y) c -> (b trgt) c x y",x=model_input["target_frame"].size(-2)) 
+                                            for img in (model_out["fine_rgb" if "fine_rgb" in model_out else "rgb"],ground_truth["target_frame"])]
+    depth_est = rearrange(model_out["depth"][:,:-1],"b trgt (x y) c -> (b trgt) c x y",x=model_input["target_frame"].size(-2))
 
     psnr += piqa.PSNR()(rgb_est.clip(0,1).contiguous(),rgb_gt.clip(0,1).contiguous())
     lpips += loss_fn_vgg(rgb_est*2-1,rgb_gt*2-1).mean()
@@ -45,10 +61,10 @@ for eval_idx,eval_dataset_idx in enumerate(tqdm(torch.linspace(0,len(val_dataset
 
         try: os.mkdir(eval_idx_dir)
         except: pass
-        ctxt_rgbs = torch.cat((model_input["ctxt_rgb"][:,0],model_input["trgt_rgb"][:,model_input["trgt_rgb"].size(1)//2],model_input["trgt_rgb"][:,-1]))*.5+.5
-        fp = os.path.join(eval_idx_dir,f"ctxt0.png");plt.imsave(fp,ctxt_rgbs[0].clip(0,1).permute(1,2,0).cpu().numpy())
-        fp = os.path.join(eval_idx_dir,f"ctxt1.png");plt.imsave(fp,ctxt_rgbs[1].clip(0,1).permute(1,2,0).cpu().numpy())
-        fp = os.path.join(eval_idx_dir,f"ctxt2.png");plt.imsave(fp,ctxt_rgbs[2].clip(0,1).permute(1,2,0).cpu().numpy())
+        ctxt_rgbs = torch.cat((model_input["sequence"][:,0],model_input["target_frame"][:,model_input["target_frame"].size(1)//2],model_input["target_frame"][:,-1]))*.5+.5
+        fp = os.path.join(eval_idx_dir,f"sequence0.png");plt.imsave(fp,ctxt_rgbs[0].clip(0,1).permute(1,2,0).cpu().numpy())
+        fp = os.path.join(eval_idx_dir,f"sequence1.png");plt.imsave(fp,ctxt_rgbs[1].clip(0,1).permute(1,2,0).cpu().numpy())
+        fp = os.path.join(eval_idx_dir,f"sequence2.png");plt.imsave(fp,ctxt_rgbs[2].clip(0,1).permute(1,2,0).cpu().numpy())
         for i,(rgb_est,rgb_gt,depth) in enumerate(zip(rgb_est,rgb_gt,depth_est)):
             fp = os.path.join(eval_idx_dir,f"{i}_est.png");plt.imsave(fp,rgb_est.clip(0,1).permute(1,2,0).cpu().numpy())
             print(fp)
@@ -58,7 +74,7 @@ for eval_idx,eval_dataset_idx in enumerate(tqdm(torch.linspace(0,len(val_dataset
     # Pose plotting/evaluation
     if "poses" in model_out:
         import scipy.spatial
-        pose_est,pose_gt = model_out["poses"][0][:,:3,-1].cpu(),model_input["trgt_c2w"][0][:,:3,-1].cpu()
+        pose_est,pose_gt = model_out["poses"][0][:,:3,-1].cpu(),model_input["target_poses"][0][:,:3,-1].cpu()
         pose_gt,pose_est,_ = scipy.spatial.procrustes(pose_gt.numpy(),pose_est.numpy())
         ate += ((pose_est-pose_gt)**2).mean()
         if args.save_imgs:

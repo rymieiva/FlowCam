@@ -1,21 +1,21 @@
 #usage: python demo.py --demo_rgb /nobackup/projects/public/facebook-co3dv2/hydrant/615_99120_197713/images --intrinsics 1.7671e+03,3.1427e+03,5.3550e+02,9.5150e+02 -c ~/storage/logs/hydrant_skip123.pt --render_imgs --low_res 144 128
-
+# python demo.py --demo_rgb "C:\Users\rymi\work\FlowCam\hydrant_flowcam\hydrant\106_12648_23157\images" --intrinsics 3.1621382999823697,1.7765103444433439,0.0,0.0 -c "C:\Users\rymi\OneDrive - EIVA\Desktop\flowcam\co3d_hydrant.pt" --render_imgs --low_res 144 128 --n_skip 1
+# python demo.py -c "C:\Users\rymi\OneDrive - EIVA\Desktop\flowcam\co3d_hydrant.pt" --render_imgs --low_res 144 128
 from run import *
-
 import torch
 import random
-from torch.utils.data import Dataset
-from glob import glob
 import imageio
 import numpy as np
 import matplotlib.pyplot as plt
-
 import torch.nn.functional as F
+from PIL import Image
+from torch.utils.data import Dataset
+from glob import glob
+from data.flowcam_data import FlowCamDataset
 
-from einops import rearrange, repeat
-hom = lambda x, i=-1: torch.cat((x, torch.ones_like(x.unbind(i)[0].unsqueeze(i))), i)
-ch_sec = lambda x: rearrange(x,"... c x y -> ... (x y) c")
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
+"""
 # A quick dummy dataset for the demo rgb folder
 class SingleVid(Dataset):
 
@@ -35,8 +35,8 @@ class SingleVid(Dataset):
         
         n_skip=self.num_skip+1
         paths = self.img_paths[idx:idx+self.n_trgt*n_skip:n_skip]
-        imgs=torch.stack([torch.from_numpy(plt.imread(path)).permute(2,0,1) for path in paths]).float()
-
+        #imgs=torch.stack([torch.from_numpy(plt.imread(path)).permute(2,0,1) for path in paths]).float()
+        imgs = torch.stack([torch.from_numpy(np.array(Image.open(path).resize((self.low_res[1], self.low_res[0])))).permute(2, 0, 1) for path in paths]).float()
         imgs_large = F.interpolate(imgs,self.hi_res,antialias=True,mode="bilinear")
         frames = F.interpolate(imgs,self.low_res)
 
@@ -50,15 +50,15 @@ class SingleVid(Dataset):
         #imgs large values in [0,255], imgs in [-1,1], gt_rgb in [0,1],
 
         model_input = {
-                "trgt_rgb": frames[1:],
-                "ctxt_rgb": frames[:-1],
-                "trgt_rgb_large": imgs_large[1:],
-                "ctxt_rgb_large": imgs_large[:-1],
+                "target_frame": frames[1:],
+                "sequence": frames[:-1],
+                "target_frame_large": imgs_large[1:],
+                "sequence_large": imgs_large[:-1],
                 "x_pix": uv[1:],
                 }
         gt = {
-                "trgt_rgb": ch_sec(frames[1:])*.5+.5,
-                "ctxt_rgb": ch_sec(frames[:-1])*.5+.5,
+                "target_frame": ch_sec(frames[1:])*.5+.5,
+                "sequence": ch_sec(frames[:-1])*.5+.5,
                 "x_pix": uv[1:],
                 }
 
@@ -71,7 +71,23 @@ class SingleVid(Dataset):
 
         return model_input,gt
 
-dataset=SingleVid(args.demo_rgb,args.intrinsics,args.vid_len,args.n_skip,args.low_res)
+#dataset=SingleVid(args.demo_rgb,args.intrinsics,args.vid_len,args.n_skip,args.low_res)
+"""
+
+# Instantiation of FlowCamDataset in demo.py
+dataset = FlowCamDataset(
+    num_context=6,
+    n_skip=1,
+    num_trgt=6,
+    low_res=args.low_res,
+    depth_scale=1,
+    val=True,
+    num_cat=1000,
+    overfit=False,
+    category="hydrant",
+    use_mask=False,
+    use_v1=True
+)
 
 all_poses = torch.tensor([]).cuda()
 all_render_rgb=torch.tensor([]).cuda()
@@ -86,21 +102,23 @@ for seq_i in range(len(dataset)//(dataset.n_trgt)):
     all_render_rgb = torch.cat((all_render_rgb,out["rgb"][0]))
     all_render_depth = torch.cat((all_render_depth,out["depth"][0]))
 
-out_dir="demo_output/"+args.demo_rgb.replace("/","_")
+out_dir="C:\\Users\\rymi\\work\\FlowCam\\demo_output"
 os.makedirs(out_dir,exist_ok=True)
+
 fig = plt.figure()
 ax = fig.add_subplot(111, projection='3d')
 ax.plot(*all_poses[:,:3,-1].T.cpu().numpy())
 ax.xaxis.set_tick_params(labelbottom=False);ax.yaxis.set_tick_params(labelleft=False);ax.zaxis.set_tick_params(labelleft=False)
 ax.view_init(elev=10., azim=45)
 plt.tight_layout()
-fp = os.path.join(out_dir,f"pose_plot.png");plt.savefig(fp,bbox_inches='tight');plt.close()
 
+fp = os.path.join(out_dir,f"pose_plot.png");plt.savefig(fp,bbox_inches='tight');plt.close()
 fp = os.path.join(out_dir,f"poses.npy");np.save(fp,all_poses.cpu())
+
 if args.render_imgs:
     out_dir=os.path.join(out_dir,"renders")
-    os.makedirs(out_dir,exist_ok=True)
-    for i,(rgb,depth) in enumerate(zip(all_render_rgb.unflatten(1,model_input["trgt_rgb"].shape[-2:]),all_render_depth.unflatten(1,model_input["trgt_rgb"].shape[-2:]))):
+    os.makedirs(out_dir,exist_ok=True) # TODO replace trgt_rgb with target_frame
+    for i,(rgb,depth) in enumerate(zip(all_render_rgb.unflatten(1,model_input["target_frame"].shape[-2:]),all_render_depth.unflatten(1,model_input["target_frame"].shape[-2:]))):
         plt.imsave(os.path.join(out_dir,"render_rgb_%04d.png"%i),rgb.clip(0,1).cpu().numpy())
         plt.imsave(os.path.join(out_dir,"render_depth_%04d.png"%i),depth.clip(0,1).cpu().numpy())
 

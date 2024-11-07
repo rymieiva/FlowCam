@@ -14,6 +14,11 @@ import vis_scripts
 from data.KITTI import KittiDataset
 from data.co3d import Co3DNoCams
 from data.realestate10k_dataio import RealEstate10k
+from data.flowcam_data import FlowCamDataset
+
+# Set the environment variable if not already set
+if 'CO3D_ROOT' not in os.environ:
+    os.environ['CO3D_ROOT'] = r'C:\Users\rymi\work\FlowCam\hydrant_flowcam'
 
 def to_gpu(ob): return {k: to_gpu(v) for k, v in ob.items()} if isinstance(ob, dict) else ob.cuda()
 
@@ -30,7 +35,8 @@ parser.add_argument('-v','--vid_len', type=int,default=6,help="video length or n
 parser.add_argument('--midas_sup', default=False, action=argparse.BooleanOptionalAction,help="Whether to use midas depth supervision or not")
 parser.add_argument('--category', type=str,default=None,help="if want to use a specific co3d category, such as 'bicycle', specify here")
 # model parameters
-parser.add_argument('--n_skip', nargs="+",type=int,default=0,help="Number of frames to skip between adjacent frames in dataloader. If list, dataset randomly chooses between skips. Only used for co3d")
+#parser.add_argument('--n_skip', nargs="+",type=int,default=0,help="Number of frames to skip between adjacent frames in dataloader. If list, dataset randomly chooses between skips. Only used for co3d")
+parser.add_argument('--n_skip', type=int, default=1, help="Number of frames to skip between frames in dataloader.")
 parser.add_argument('--n_ctxt', type=int,default=2,help="Number of context views to use. 1 is just first frame, 2 is second and last, 3 is also middle, etc")
 # eval/vis 
 parser.add_argument('--eval', default=False, action=argparse.BooleanOptionalAction,help="whether to train or run evaluation")
@@ -56,7 +62,7 @@ wandb.save(os.path.join(save_dir, "checkpoint*"))
 wandb.save(os.path.join(save_dir, "video*"))
 
 # Make dataset
-get_dataset = lambda val=False: ( Co3DNoCams(num_trgt=args.vid_len+1,low_res=(156,102),num_cat=1 if args.dataset=="hydrant" else 10 if args.dataset=="10cat" else 30,
+get_dataset = lambda val=False: ( FlowCamDataset(num_trgt=args.vid_len+1,low_res=(156,102),num_cat=1 if args.dataset=="hydrant" else 10 if args.dataset=="10cat" else 30,
                                              n_skip=args.n_skip,val=val,category=args.category) if args.dataset in ["hydrant","10cat","allcat"] 
                              else RealEstate10k(imsl=128, num_ctxt_views=2, num_query_views=args.vid_len+1, val=val, n_skip = args.n_skip) if args.dataset == "realestate" 
                              else KittiDataset(num_context=1,num_trgt=args.vid_len+1,low_res=(76,250),val=val,n_skip=args.n_skip)
