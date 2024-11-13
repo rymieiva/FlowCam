@@ -241,22 +241,23 @@ class FlowCamDataset(torch.utils.data.Dataset):
         uv = uv[None].expand(len(imgs),-1,-1,-1).flatten(1,2)
 
         model_input = {
-                "target_frame": imgs[1:],
-                "target_frame_med": imgs_med[1:],
-                "target_frame_large": imgs_large[1:],
-                "sequence": imgs[:-1],
-                "sequence_med": imgs_med[:-1],
-                "sequence_large": imgs_large[:-1],
+                "keyframe": imgs,
+                # "keyframe_med": imgs_med,
+                # "keyframe_large" : imgs_large,
+                "trgt_rgb_large": imgs_large[1:],
+                "ctxt_rgb_large": imgs_large[:-1],
+                "trgt_rgb_med": imgs_med[1:],
+                "ctxt_rgb_med": imgs_med[:-1],
+                "intrinsics": Ks[1:],
+                "x_pix": uv[1:],
                 "target_poses": c2w[1:],
                 #"context_poses": c2w[:-1], # Needed in vis_scripts.py
-                "keyframe_intrinsics": Ks[1:],
-                "x_pix": uv[1:],
                 }
 
         gt = {
-                "target_frame": ch_sec(imgs[1:])*.5+.5, # mapping the normalized images [-1, 1] range into [0, 1]
-                "sequence": ch_sec(imgs[:-1])*.5+.5,    # for visualization
-                "keyframe_intrinsics": Ks[1:],
+                "trgt_rgb": ch_sec(imgs[1:])*.5+.5,
+                "ctxt_rgb": ch_sec(imgs[:-1])*.5+.5,
+                "intrinsics": Ks[1:],
                 "x_pix": uv[1:],
                 }
 

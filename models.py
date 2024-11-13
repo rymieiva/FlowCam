@@ -49,13 +49,21 @@ class FlowCam(nn.Module):
         self.corr_weighter_perpoint.apply(mlp_modules.init_weights_normal)
 
     def encoder(self,model_input):
-        imsize=model_input["sequence"].shape[-2:]
+
+        # Extract all frames from keyframe
+        keyframes = model_input["keyframe"]  # This now contains all frames in the sequence
+
+        # Derive ctxt_rgb and trgt_rgb from keyframes
+        ctxt_rgb = keyframes[:-1]  # Context frames: imgs[:-1]
+        trgt_rgb = keyframes[1:]   # Target frames: imgs[1:]
+
+        imsize=ctxt_rgb.shape[-2:]
 
         if "backbone_feats" in model_input: return model_input["backbone_feats"]
         if "bwd_flow" not in model_input: model_input = self.raft_midas_net(model_input)
 
         # ctxt[1:]==trgt[:-1], using this property to avoid redundant computation
-        all_rgb = torch.cat((model_input["sequence"][:,:1],model_input["target_frame"]),1)
+        all_rgb = torch.cat((ctxt_rgb[:,:1],trgt_rgb),1)
         all_flow = torch.cat((model_input["bwd_flow"][:,:1],model_input["bwd_flow"]),1)
 
         # Resnet rgb+flow feats
@@ -63,7 +71,7 @@ class FlowCam(nn.Module):
         rgb_flow_feats = self.nerf_enc_flow(rgb_flow,imsize)
 
         # Add rays to features for some amount of focal length information
-        rds = self.pos_encoder(geometry.get_world_rays(model_input["x_pix"], model_input["keyframe_intrinsics"], None)[1])
+        rds = self.pos_encoder(geometry.get_world_rays(model_input["x_pix"], model_input["intrinsics"], None)[1])
         rds = ch_fst(torch.cat((rds[:,:1],rds),1),imsize[0])
 
         all_feats = self.ray_comb(torch.cat((rgb_flow_feats,rds),2).flatten(0,1)).unflatten(0,all_rgb.shape[:2])
@@ -74,8 +82,15 @@ class FlowCam(nn.Module):
 
     def forward(self, model_input, trgt_rays=None,ctxt_rays=None,poses=None):
 
-        imsize=model_input["sequence"].shape[-2:]
-        (b,n_ctxt),n_trgt=model_input["sequence"].shape[:2],model_input["target_frame"].size(1)
+        # Extract all frames from keyframe
+        keyframes = model_input["keyframe"]  # This now contains all frames in the sequence
+
+        # Derive ctxt_rgb and trgt_rgb from keyframes
+        ctxt_rgb = keyframes[:-1]  # Context frames: imgs[:-1]
+        trgt_rgb = keyframes[1:]   # Target frames: imgs[1:]
+        
+        imsize=ctxt_rgb.shape[-2:]
+        (b,n_ctxt),n_trgt=ctxt_rgb.shape[:2],trgt_rgb.size(1)
         add_ctxt = lambda x: torch.cat((x[:,:1],x),1)
         if trgt_rays is None: trgt_rays,ctxt_rays = self.make_rays(model_input)
 
@@ -83,15 +98,15 @@ class FlowCam(nn.Module):
         backbone_feats= self.encoder(model_input) 
 
         # Expand identity camera into 3d points and render rays
-        ros, rds = geometry.get_world_rays(add_ctxt(model_input["x_pix"]), add_ctxt(model_input["keyframe_intrinsics"]), None)
+        ros, rds = geometry.get_world_rays(add_ctxt(model_input["x_pix"]), add_ctxt(model_input["intrinsics"]), None)
         eye_pts, z_vals = renderer.sample_points_along_rays(self.near, self.far, self.n_samples, ros, rds, device=model_input["x_pix"].device,logspace=self.logspace)
-        eye_render, eye_depth, eye_weights= self.renderer( backbone_feats, eye_pts[:,:,ctxt_rays], add_ctxt(model_input["keyframe_intrinsics"]), z_vals,identity=True)
+        eye_render, eye_depth, eye_weights= self.renderer( backbone_feats, eye_pts[:,:,ctxt_rays], add_ctxt(model_input["intrinsics"]), z_vals,identity=True)
 
         # Render out correspondence's surface point now
         corresp_uv = (model_input["x_pix"]+ch_sec(model_input["bwd_flow"]))[:,:,ctxt_rays]
-        ros, rds = geometry.get_world_rays(corresp_uv, model_input["keyframe_intrinsics"], None)
+        ros, rds = geometry.get_world_rays(corresp_uv, model_input["intrinsics"], None)
         corresp_pts, _ = renderer.sample_points_along_rays(self.near, self.far, self.n_samples, ros, rds, device=model_input["x_pix"].device,logspace=self.logspace)
-        _, _, corresp_weights= self.renderer( backbone_feats[:,:-1], corresp_pts, model_input["keyframe_intrinsics"], z_vals,identity=True)
+        _, _, corresp_weights= self.renderer( backbone_feats[:,:-1], corresp_pts, model_input["intrinsics"], z_vals,identity=True)
 
         # Predict correspondence weights as function of source feature and correspondence
         corresp_feat = F.grid_sample(backbone_feats[:,:-1].flatten(0,1),corresp_uv.flatten(0,1).unsqueeze(1)*2-1).squeeze(-2).permute(0,2,1).unflatten(0,(b,n_trgt))
@@ -110,13 +125,13 @@ class FlowCam(nn.Module):
 
         # Pose induced flow using ctxt depth and then multiview rendered depth (latter not used in paper experiments)
         corresp_surf_from_pose = (torch.einsum("bcij,bcdkj->bcdki",adj_transf,hom(eye_pts[:,1:]))[:,:,ctxt_rays,...,:3]*eye_weights[:,1:]).sum(-2)
-        flow_from_pose = geometry.project(corresp_surf_from_pose.flatten(0,1), model_input["keyframe_intrinsics"].flatten(0,1))[0].unflatten(0,(b,n_trgt))-model_input["x_pix"][:,:,ctxt_rays]
+        flow_from_pose = geometry.project(corresp_surf_from_pose.flatten(0,1), model_input["intrinsics"].flatten(0,1))[0].unflatten(0,(b,n_trgt))-model_input["x_pix"][:,:,ctxt_rays]
         corresp_surf_from_pose_render = (torch.einsum("bcij,bcdkj->bcdki",adj_transf,hom(eye_pts[:,1:]))[:,:,trgt_rays,...,:3]*render["weights"]).sum(-2)
-        flow_from_pose_render = geometry.project(corresp_surf_from_pose_render.flatten(0,1), model_input["keyframe_intrinsics"].flatten(0,1))[0].unflatten(0,(b,n_trgt))-model_input["x_pix"][:,:,trgt_rays]
+        flow_from_pose_render = geometry.project(corresp_surf_from_pose_render.flatten(0,1), model_input["intrinsics"].flatten(0,1))[0].unflatten(0,(b,n_trgt))-model_input["x_pix"][:,:,trgt_rays]
 
         out= {
                 "rgb":render["rgb"], 
-                "sequence":eye_render[:,:-1],
+                "ctxt_rgb":eye_render[:,:-1],
                 "poses":poses,
                 "depth":render["depth"], 
                 "ctxt_depth":eye_depth[:,:-1], 
@@ -133,20 +148,33 @@ class FlowCam(nn.Module):
         return out
 
     def render(self,model_input,poses,trgt_rays,query_pose=None):
+        
+        # Extract all frames from keyframe
+        keyframes = model_input["keyframe"]  # This now contains all frames in the sequence
+
+        # Derive ctxt_rgb and trgt_rgb from keyframes
+        ctxt_rgb = keyframes[:-1]  # Context frames: imgs[:-1]
+        trgt_rgb = keyframes[1:]   # Target frames: imgs[1:]
+
         if query_pose is None: query_pose=poses
 
-        ros, rds = geometry.get_world_rays(model_input["x_pix"][:,:query_pose.size(1),trgt_rays], model_input["keyframe_intrinsics"][:,:query_pose.size(1)], query_pose)
+        ros, rds = geometry.get_world_rays(model_input["x_pix"][:,:query_pose.size(1),trgt_rays], model_input["intrinsics"][:,:query_pose.size(1)], query_pose)
         query_pts, z_vals = renderer.sample_points_along_rays(self.near, self.far, self.n_samples, ros, rds, device=model_input["x_pix"].device,logspace=self.logspace)
 
         ctxt_poses = torch.cat((torch.eye(4).cuda()[None].expand(poses.size(0),-1,-1)[:,None],poses),1)
-        ctxt_idxs = [0,-1,model_input["target_frame"].size(1)//2][:self.num_view]
+        ctxt_idxs = [0,-1,trgt_rgb.size(1)//2][:self.num_view]
         ctxt_pts = torch.einsum("bvcij,bcdkj->bvcdki",ctxt_poses[:,ctxt_idxs].inverse().unsqueeze(2),hom(query_pts))[...,:3] # in coord system of ctxt frames
-        rgb, depth, weights = self.renderer(model_input["backbone_feats"][:,ctxt_idxs], ctxt_pts,model_input["keyframe_intrinsics"][:,:query_pose.size(1)],z_vals)
+        rgb, depth, weights = self.renderer(model_input["backbone_feats"][:,ctxt_idxs], ctxt_pts,model_input["intrinsics"][:,:query_pose.size(1)],z_vals)
         return {"rgb":rgb,"depth":depth,"weights":weights}
 
     def make_rays(self,model_input):
 
-        imsize=model_input["sequence"].shape[-2:]
+        # Extract all frames from keyframe
+        keyframes = model_input["keyframe"]  # This now contains all frames in the sequence
+
+        # Derive ctxt_rgb and trgt_rgb from keyframes
+        ctxt_rgb = keyframes[:-1]  # Context frames: imgs[:-1]
+        imsize=ctxt_rgb.shape[-2:]
 
         # Pick random subset of rays
         crop_res=32 if self.n_samples<100 else 16
@@ -160,10 +188,18 @@ class FlowCam(nn.Module):
         return trgt_rays,ctxt_rays
 
     def render_full_img(self,model_input, query_pose=None,sample_out=None):
+        
+        # Extract all frames from keyframe
+        keyframes = model_input["keyframe"]  # This now contains all frames in the sequence
+
+        # Derive ctxt_rgb and trgt_rgb from keyframes
+        ctxt_rgb = keyframes[:-1]  # Context frames: imgs[:-1]
+        trgt_rgb = keyframes[1:]   # Target frames: imgs[1:]
+
         num_chunk=8 if self.n_samples<90 else 16
 
-        imsize=model_input["sequence"].shape[-2:]
-        (b,n_ctxt),n_trgt=model_input["sequence"].shape[:2],model_input["target_frame"].size(1)
+        imsize=ctxt_rgb.shape[-2:]
+        (b,n_ctxt),n_trgt=ctxt_rgb.shape[:2],trgt_rgb.size(1)
 
         if sample_out is None: sample_out = self(model_input)
 
@@ -199,11 +235,11 @@ class MLPImplicit(nn.Module):
         self.phi2.apply(mlp_modules.init_weights_normal)
 
     # Note this method does not use cam2world and assumes `pos` is transformed to each context view's coordinate system and duplicated for each context view
-    def forward(self,ctxt_feats,pos,keyframe_intrinsics,samp_dists,flow_feats=None,identity=False):
+    def forward(self,ctxt_feats,pos,intrinsics,samp_dists,flow_feats=None,identity=False):
 
         if identity: # 1:1 correspondence of ctxt img to trgt render, used for rendering out identity camera 
             b_org,n_trgt_org = ctxt_feats.shape[:2]
-            ctxt_feats,pos,keyframe_intrinsics = [x.flatten(0,1)[:,None] for x in [ctxt_feats,pos,keyframe_intrinsics]]
+            ctxt_feats,pos,intrinsics = [x.flatten(0,1)[:,None] for x in [ctxt_feats,pos,intrinsics]]
 
         if len(pos.shape)==5: pos=pos.unsqueeze(1) # unsqueeze ctxt if no ctxt dim (means only 1 ctxt supplied)
         (b,n_ctxt),n_trgt=(ctxt_feats.shape[:2],pos.size(2))
@@ -212,7 +248,7 @@ class MLPImplicit(nn.Module):
         img_feat, pos_,_ = geometry.pixel_aligned_features( 
                 repeat(pos,"b ctxt trgt xy d c -> (b ctxt trgt) (xy d) c"),
                 repeat(torch.eye(4)[None,None].to(ctxt_feats),"1 1 x y -> (b ctxt trgt) x y",b=b,ctxt=n_ctxt,trgt=n_trgt),
-                repeat(keyframe_intrinsics,"b trgt x y -> (b ctxt trgt) x y",ctxt=n_ctxt),
+                repeat(intrinsics,"b trgt x y -> (b ctxt trgt) x y",ctxt=n_ctxt),
                 repeat(ctxt_feats,"b ctxt c x y -> (b ctxt trgt) c x y",trgt=n_trgt),
                 )
         img_feat,pos= [rearrange(x,"(b ctxt trgt) (xy d) c -> (b trgt) xy d ctxt c",b=b,ctxt=n_ctxt,d=samp_dists.size(-1)) for x in [img_feat,pos_]]
@@ -249,9 +285,39 @@ class RaftAndMidas(nn.Module):
 
     def forward(self,model_input):
 
+        # Extract all frames from keyframe
+        keyframes = model_input["keyframe"]
+        # keyframes_med = model_input["keyframe_med"]
+        # keyframes_large = model_input["keyframe_large"]
+
+        # Derive ctxt_rgb and trgt_rgb from keyframes
+        ctxt_rgb = keyframes[:-1]  # Context frames: imgs[:-1]
+        # ctxt_rgb_med = keyframes_med[:-1]
+        # ctxt_rgb_large = keyframes_large[:-1]
+        trgt_rgb = keyframes[1:]   # Target frames: imgs[1:]
+        # trgt_rgb_med = keyframes_med[1:]
+        # trgt_rgb_large = keyframes_large[1:]       
+
+        # # Revert the normalization from [-1, 1] back to [0, 255]
+        # keyframes_reverted = (keyframes + 1) * 255 / 2
+        # keyframes_reverted = keyframes_reverted.unsqueeze(0)  # Add batch dimension
+
+        # # Ensure keyframes_reverted has four dimensions (N, C, H, W)
+        # if keyframes_reverted.dim() == 3:  # Missing batch dimension
+        #     keyframes_reverted = keyframes_reverted.unsqueeze(0)  # Adds batch dimension if missing
+
+        # # Now, use F.interpolate to upscale spatial dimensions correctly
+        # large_scale = 2
+        # target_large = (int(256 * large_scale), int(288 * large_scale))  # (512, 576)
+        # target_med = (256, 288)
+
+        # # Apply the interpolation with spatial target sizes for imgs_large and imgs_med
+        # imgs_large = F.interpolate(keyframes_reverted, size=target_large, mode="bilinear", antialias=True)
+        # imgs_med = F.interpolate(keyframes_reverted, size=target_med, mode="bilinear", antialias=True)
+
         # Estimate raft flow and midas depth if no flow/depth in dataset
-        imsize=model_input["sequence"].shape[-2:]
-        (b,n_ctxt),n_trgt=model_input["sequence"].shape[:2],model_input["target_frame"].size(1)
+        imsize=ctxt_rgb.shape[-2:]
+        (b,n_ctxt),n_trgt=ctxt_rgb.shape[:2],trgt_rgb.size(1)
         # Inputs should be in range [0,255]; TODO change to [-1,1] to stay consistent with other RGB range 
 
         with torch.no_grad():
@@ -259,7 +325,8 @@ class RaftAndMidas(nn.Module):
             if "bwd_flow" not in model_input and self.run_raft:
                 raft = lambda x,y: F.interpolate(self.raft(x,y,num_flow_updates=12)[-1]/(torch.tensor(x.shape[-2:][::-1])-1).to(x)[None,:,None,None],imsize)
                 #raft_rgbs = torch.cat([self.midas_transforms(raft_rgb.permute(1,2,0).cpu().numpy()) for raft_rgb in raft_rgbs]).cuda()
-                raft_inputs = self.raft_transforms(model_input["target_frame_large"].flatten(0,1).to(torch.uint8),model_input["sequence_large"].flatten(0,1).to(torch.uint8))
+                # raft_inputs = self.raft_transforms(trgt_rgb_large.flatten(0,1).to(torch.uint8),ctxt_rgb_large.flatten(0,1).to(torch.uint8))
+                raft_inputs = self.raft_transforms(model_input["trgt_rgb_large"].flatten(0,1).to(torch.uint8),model_input["ctxt_rgb_large"].flatten(0,1).to(torch.uint8))
                 model_input["bwd_flow"] = raft(*raft_inputs).unflatten(0,(b,n_trgt))
 
             # Compute midas depth if not on a datastet with depth
@@ -267,7 +334,8 @@ class RaftAndMidas(nn.Module):
                 # Compute midas depth for sup.
                 # TODO normalize this input correctly based on torch transform. I think it's just imagenet + [0,1] mapping but check 
                 midas = lambda x: F.interpolate(1/(1e-3+self.midas_large(x)).unsqueeze(1),imsize)
-                midas_rgbs = torch.cat((model_input["sequence_med"],model_input["target_frame_med"][:,-1:]),1).flatten(0,1)
+                #midas_rgbs = torch.cat((ctxt_rgb_med,trgt_rgb_med[:,-1:]),1).flatten(0,1)
+                midas_rgbs = torch.cat((model_input["ctxt_rgb_med"],model_input["trgt_rgb_med"][:,-1:]),1).flatten(0,1)
                 midas_rgbs = (midas_rgbs/255)*2-1
                 all_depth = midas(midas_rgbs).unflatten(0,(b,n_trgt+1))
                 model_input["trgt_depth"] = all_depth[:,1:]
