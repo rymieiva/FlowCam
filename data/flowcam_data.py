@@ -8,31 +8,152 @@ import torch.nn.functional as F
 import torch
 import random
 import imageio
-import imageio.v3 as iio
 import numpy as np
-import sys
-import gzip
-import json
-import matplotlib.pyplot as plt
 from glob import glob
 from collections import defaultdict
 from pdb import set_trace as pdb
 from itertools import combinations
 from random import choice
-from torchvision import transforms
-from PIL import Image
-from einops import rearrange, repeat
+import matplotlib.pyplot as plt
+import imageio.v3 as iio
 
-# Utility lambda functions for tensor manipulations
+from torchvision import transforms
+
+import sys
+
+from glob import glob
+import os
+import gzip
+import json
+import numpy as np
+
+from PIL import Image
+def _load_16big_png_depth(depth_png) -> np.ndarray:
+    with Image.open(depth_png) as depth_pil:
+        # the image is stored with 16-bit depth but PIL reads it as I (32 bit).
+        # we cast it to uint16, then reinterpret as float16, then cast to float32
+        depth = (
+            np.frombuffer(np.array(depth_pil, dtype=np.uint16), dtype=np.float16)
+            .astype(np.float32)
+            .reshape((depth_pil.size[1], depth_pil.size[0]))
+        )
+    return depth
+def _load_depth(path, scale_adjustment) -> np.ndarray:
+    d = _load_16big_png_depth(path) * scale_adjustment
+    d[~np.isfinite(d)] = 0.0
+    return d[None]  # fake feature channel
+
+# Geometry functions below used for calculating depth, ignore
+def glob_imgs(path):
+    imgs = []
+    for ext in ["*.png", "*.jpg", "*.JPEG", "*.JPG"]:
+        imgs.extend(glob(os.path.join(path, ext)))
+    return imgs
+
+
+def pick(list, item_idcs):
+    if not list:
+        return list
+    return [list[i] for i in item_idcs]
+
+
+def parse_intrinsics(intrinsics):
+    fx = intrinsics[..., 0, :1]
+    fy = intrinsics[..., 1, 1:2]
+    cx = intrinsics[..., 0, 2:3]
+    cy = intrinsics[..., 1, 2:3]
+    return fx, fy, cx, cy
+
+
+from einops import rearrange, repeat
 ch_sec = lambda x: rearrange(x,"... c x y -> ... (x y) c")
 hom = lambda x, i=-1: torch.cat((x, torch.ones_like(x.unbind(i)[0].unsqueeze(i))), i)
 
+
+def expand_as(x, y):
+    if len(x.shape) == len(y.shape):
+        return x
+
+    for i in range(len(y.shape) - len(x.shape)):
+        x = x.unsqueeze(-1)
+
+    return x
+
+
+def lift(x, y, z, intrinsics, homogeneous=False):
+    """
+
+    :param self:
+    :param x: Shape (batch_size, num_points)
+    :param y:
+    :param z:
+    :param intrinsics:
+    :return:
+    """
+    fx, fy, cx, cy = parse_intrinsics(intrinsics)
+
+    x_lift = (x - expand_as(cx, x)) / expand_as(fx, x) * z
+    y_lift = (y - expand_as(cy, y)) / expand_as(fy, y) * z
+
+    if homogeneous:
+        return torch.stack((x_lift, y_lift, z, torch.ones_like(z).to(x.device)), dim=-1)
+    else:
+        return torch.stack((x_lift, y_lift, z), dim=-1)
+
+
+def world_from_xy_depth(xy, depth, cam2world, intrinsics):
+    batch_size, *_ = cam2world.shape
+
+    x_cam = xy[..., 0]
+    y_cam = xy[..., 1]
+    z_cam = depth
+
+    pixel_points_cam = lift(
+        x_cam, y_cam, z_cam, intrinsics=intrinsics, homogeneous=True
+    )
+    world_coords = torch.einsum("b...ij,b...kj->b...ki", cam2world, pixel_points_cam)[
+        ..., :3
+    ]
+
+    return world_coords
+
+
+def get_ray_directions(xy, cam2world, intrinsics, normalize=True):
+    z_cam = torch.ones(xy.shape[:-1]).to(xy.device)
+    pixel_points = world_from_xy_depth(
+        xy, z_cam, intrinsics=intrinsics, cam2world=cam2world
+    )  # (batch, num_samples, 3)
+
+    cam_pos = cam2world[..., :3, 3]
+    ray_dirs = pixel_points - cam_pos[..., None, :]  # (batch, num_samples, 3)
+    if normalize:
+        ray_dirs = F.normalize(ray_dirs, dim=-1)
+    return ray_dirs
+
+from PIL import Image
+def _load_16big_png_depth(depth_png) -> np.ndarray:
+    with Image.open(depth_png) as depth_pil:
+        # the image is stored with 16-bit depth but PIL reads it as I (32 bit).
+        # we cast it to uint16, then reinterpret as float16, then cast to float32
+        depth = (
+            np.frombuffer(np.array(depth_pil, dtype=np.uint16), dtype=np.float16)
+            .astype(np.float32)
+            .reshape((depth_pil.size[1], depth_pil.size[0]))
+        )
+    return depth
+def _load_depth(path, scale_adjustment) -> np.ndarray:
+    d = _load_16big_png_depth(path) * scale_adjustment
+    d[~np.isfinite(d)] = 0.0
+    return d[None]  # fake feature channel
+
+# NOTE currently using CO3D V1 because they switch to NDC cameras in 2. TODO is to make conversion code (different intrinsics), verify pointclouds, and switch. 
+
 class FlowCamDataset(torch.utils.data.Dataset):
     """Dataset for a class of objects, where each datapoint is a SceneInstanceDataset."""
-
+    """
     def __init__(
         self,
-        num_context=2,
+        num_context=3,
         n_skip=1,
         num_trgt=1,
         low_res=(128,144),
@@ -43,6 +164,20 @@ class FlowCamDataset(torch.utils.data.Dataset):
         category=None,
         use_mask=False,
         use_v1=True,
+        # delete below, not used
+        vary_context_number=False,
+        query_sparsity=None,
+        img_sidelength=None,
+        input_img_sidelength=None,
+        max_num_instances=None,
+        max_observations_per_instance=None,
+        specific_observation_idcs=None,
+        test=False,
+        test_context_idcs=None,
+        context_is_last=False,
+        context_is_first=False,
+        cache=None,
+        video=True,
     ):
 
         if num_cat is None: num_cat=1000
@@ -84,6 +219,50 @@ class FlowCamDataset(torch.utils.data.Dataset):
         self.seqs = sorted_seq
 
         print("done with dataloader init")
+
+
+
+    """
+    def __init__(
+        self,
+        num_context=3,
+        n_skip=1,
+        num_trgt=1,
+        low_res=(128, 128),
+        depth_scale=1,
+        val=False,
+        base_path=r'C:\Users\rymi\work\FlowCam\underwater\0',
+    ):
+        """
+        Custom initialization for underwater dataset without frame annotations.
+
+        Args:
+            num_context (int): Number of context frames.
+            n_skip (int): Number of frames to skip between context/target frames.
+            num_trgt (int): Number of target frames to predict.
+            low_res (tuple): Resolution to downscale images.
+            depth_scale (float): Scale for depth values (not used here).
+            val (bool): Whether this is a validation set.
+            base_path (str): Path to the image directory.
+        """
+        self.n_trgt = num_trgt
+        self.num_skip = n_skip
+        self.low_res = low_res
+        self.depth_scale = depth_scale
+        self.val = val
+        self.base_path = base_path
+
+        # Get all image paths
+        self.image_files = sorted(
+            [os.path.join(base_path, f) for f in os.listdir(base_path) if f.endswith(('.png', '.jpg', '.jpeg'))]
+        )
+        if len(self.image_files) < num_context + num_trgt:
+            raise ValueError("Not enough images in the dataset to form context and target frames.")
+
+        # Total number of usable sequences (adjust for context and target frames)
+        self.total_num_data = len(self.image_files) - (num_context + num_trgt - 1) * n_skip
+
+        print(f"Initialized dataset with {self.total_num_data} sequences from {base_path}.")
 
     def sparsify(self, dict, sparsity):
         new_dict = {}
@@ -128,7 +307,7 @@ class FlowCamDataset(torch.utils.data.Dataset):
                 continue
 
         return result
-
+    """
     def __getitem__(self, idx,seq_query=None):
 
         context = []
@@ -172,10 +351,7 @@ class FlowCamDataset(torch.utils.data.Dataset):
                 return self[np.random.randint(len(self))]
 
         #masks=[torch.from_numpy(plt.imread(os.path.join(self.base_path,x["mask"]["path"]))) for x in frames]
-        #imgs=[torch.from_numpy(plt.imread(path)) for path in paths]
-        
-        # Make a copy of the NumPy array before converting it to a tensor. This ensures the resulting array is writable.
-        imgs = [torch.from_numpy(np.array(plt.imread(path)).copy()) for path in paths]
+        imgs=[torch.from_numpy(plt.imread(path)) for path in paths]
 
         Ks=[]
         c2ws=[]
@@ -226,7 +402,9 @@ class FlowCamDataset(torch.utils.data.Dataset):
             depths = [x*y for x,y in zip(depths,masks)]
 
         large_scale=2
-        imgs_large = F.interpolate(torch.stack([x.permute(2,0,1) for x in imgs]),(int(256*large_scale),int(288*large_scale)),antialias=True,mode="bilinear")
+        imgs_large = F.interpolate(torch.stack([x.permute(2,0,1) for x in imgs]),
+                                  (int(256*large_scale),int(288*large_scale)),
+                                  antialias=True,mode="bilinear")
         imgs_med = F.interpolate(torch.stack([x.permute(2,0,1) for x in imgs]),(int(256),int(288)),antialias=True,mode="bilinear")
         imgs = F.interpolate(torch.stack([x.permute(2,0,1) for x in imgs]),low_res,antialias=True,mode="bilinear")
 
@@ -241,24 +419,106 @@ class FlowCamDataset(torch.utils.data.Dataset):
         uv = uv[None].expand(len(imgs),-1,-1,-1).flatten(1,2)
 
         model_input = {
-                "keyframe": imgs,
-                # "keyframe_med": imgs_med,
-                # "keyframe_large" : imgs_large,
+                "trgt_rgb": imgs[1:],
+                "ctxt_rgb": imgs[:-1],
                 "trgt_rgb_large": imgs_large[1:],
                 "ctxt_rgb_large": imgs_large[:-1],
                 "trgt_rgb_med": imgs_med[1:],
                 "ctxt_rgb_med": imgs_med[:-1],
+                #"ctxt_depth": depths.squeeze(1)[:-1],
+                #"trgt_depth": depths.squeeze(1)[1:],
                 "intrinsics": Ks[1:],
+                "trgt_c2w": c2w[1:],
+                "ctxt_c2w": c2w[:-1],
                 "x_pix": uv[1:],
-                "target_poses": c2w[1:],
-                #"context_poses": c2w[:-1], # Needed in vis_scripts.py
+                #"trgt_mask": masks[1:],
+                #"ctxt_mask": masks[:-1],
                 }
 
         gt = {
+                #"paths": paths,
+                #"raw_K": raw_K,
+                #"seq_name": seq_name,
                 "trgt_rgb": ch_sec(imgs[1:])*.5+.5,
                 "ctxt_rgb": ch_sec(imgs[:-1])*.5+.5,
+                #"ctxt_depth": depths.squeeze(1)[:-1].flatten(1,2).unsqueeze(-1),
+                #"trgt_depth": depths.squeeze(1)[1:].flatten(1,2).unsqueeze(-1),
                 "intrinsics": Ks[1:],
                 "x_pix": uv[1:],
+                #"seq_name": [seq_name],
+                #"trgt_mask": masks[1:].flatten(1,2).unsqueeze(-1),
+                #"ctxt_mask": masks[:-1].flatten(1,2).unsqueeze(-1),
                 }
 
         return model_input,gt
+    """
+    # Modify __getitem__ to directly load underwater images
+    def __getitem__(self, idx):
+        image_dir = r'C:\Users\rymi\work\FlowCam\underwater\0'
+        image_files = sorted(os.listdir(image_dir))
+        
+        if idx >= len(image_files) - self.n_trgt:
+            idx = random.randint(0, len(image_files) - self.n_trgt - 1)
+
+
+        # Load target and context images
+        imgs = []
+        for i in range(self.n_trgt + 1):
+            img_path = os.path.join(image_dir, image_files[idx + i])
+            img = plt.imread(img_path)
+            imgs.append(torch.from_numpy(np.copy(img)).float())  # Copy to ensure writability
+
+        # Mock intrinsics and poses
+        h, w = self.low_res
+        K = np.eye(3)  # Initialize as an identity matrix
+        K[0, 0] = K[1, 1] = max(h, w) / 2  # Approximate focal length
+        K[0, 2] = w / 2  # Principal point x-coordinate
+        K[1, 2] = h / 2  # Principal point y-coordinate
+        Ks = torch.from_numpy(K).float().unsqueeze(0).repeat(len(imgs), 1, 1)
+        print(f"h = {h}, w = {w}")
+        low_res=self.low_res
+        large_scale=2
+        imgs_large = F.interpolate(
+            torch.stack([x.permute(2, 0, 1) for x in imgs]),
+            size=(int(h * large_scale), int(w * large_scale)),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True
+        )
+
+        # Process images into model inputs
+        imgs = F.interpolate(
+            torch.stack([x.permute(2, 0, 1) for x in imgs]),
+            size=(self.low_res[0], int(self.low_res[0] * w / h)),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True
+        )
+
+        imgs = imgs / 255.0 * 2 - 1  # Normalize to [-1, 1]
+
+        uv = np.mgrid[0:low_res[0], 0:low_res[1]].astype(float).transpose(1, 2, 0)
+        uv = torch.from_numpy(np.flip(uv, axis=-1).copy()).long()
+        uv = uv/ torch.tensor([low_res[1]-1, low_res[0]-1])  # uv in [0,1]
+        uv = uv[None].expand(len(imgs),-1,-1,-1).flatten(1,2)
+
+        model_input = {
+            "trgt_rgb": imgs[1:],
+            "ctxt_rgb": imgs[:-1],
+            "trgt_rgb_large": imgs_large[1:],
+            "ctxt_rgb_large": imgs_large[:-1],
+            "intrinsics": Ks[1:],
+            #"trgt_c2w": c2w[1:],
+            #"ctxt_c2w": c2w[:-1],
+            "x_pix": uv[1:],
+        }
+        gt = {
+            # "trgt_rgb": imgs[1:], 
+            # "ctxt_rgb": imgs[:-1],
+            "trgt_rgb": ch_sec(imgs[1:])*.5+.5,
+            "ctxt_rgb": ch_sec(imgs[:-1])*.5+.5,
+            "intrinsics": Ks[1:],
+            "x_pix": uv[1:],
+        }
+
+        return model_input, gt
