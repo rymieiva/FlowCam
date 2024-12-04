@@ -16,9 +16,9 @@ from itertools import combinations
 from random import choice
 import matplotlib.pyplot as plt
 import imageio.v3 as iio
-
+import yaml
 from torchvision import transforms
-
+import datetime
 import sys
 
 from glob import glob
@@ -149,80 +149,6 @@ def _load_depth(path, scale_adjustment) -> np.ndarray:
 # NOTE currently using CO3D V1 because they switch to NDC cameras in 2. TODO is to make conversion code (different intrinsics), verify pointclouds, and switch. 
 
 class FlowCamDataset(torch.utils.data.Dataset):
-    """Dataset for a class of objects, where each datapoint is a SceneInstanceDataset."""
-    """
-    def __init__(
-        self,
-        num_context=3,
-        n_skip=1,
-        num_trgt=1,
-        low_res=(128,144),
-        depth_scale=1,#1.8/5,
-        val=False,
-        num_cat=1000,
-        overfit=False,
-        category=None,
-        use_mask=False,
-        use_v1=True,
-        # delete below, not used
-        vary_context_number=False,
-        query_sparsity=None,
-        img_sidelength=None,
-        input_img_sidelength=None,
-        max_num_instances=None,
-        max_observations_per_instance=None,
-        specific_observation_idcs=None,
-        test=False,
-        test_context_idcs=None,
-        context_is_last=False,
-        context_is_first=False,
-        cache=None,
-        video=True,
-    ):
-
-        if num_cat is None: num_cat=1000
-
-        self.n_trgt=num_trgt
-        self.use_mask=use_mask
-        self.depth_scale=depth_scale
-        self.of=overfit
-        self.val=val
-
-        self.num_skip=n_skip
-        self.low_res=low_res
-        max_num_instances = None
-
-        self.base_path=os.environ['CO3D_ROOT']
-        print(self.base_path)
-
-        # Get sequences!
-        from collections import defaultdict
-        sequences = defaultdict(list)
-        self.total_num_data=0
-        self.all_frame_names=[]
-        all_cats = [ "hydrant","teddybear","apple", "ball", "bench", "cake", "donut", "plant", "suitcase", "vase","backpack", "banana", "baseballbat", "baseballglove",  "bicycle", "book", "bottle", "bowl", "broccoli",  "car", "carrot", "cellphone", "chair", "couch", "cup",  "frisbee", "hairdryer", "handbag", "hotdog", "keyboard", "kite", "laptop", "microwave", "motorcycle", "mouse", "orange", "parkingmeter", "pizza",  "remote", "sandwich", "skateboard", "stopsign",  "toaster", "toilet", "toybus", "toyplane", "toytrain", "toytruck", "tv", "umbrella",  "wineglass", ]
-
-        for cat in (all_cats[:num_cat]) if category is None else [category]:
-            print(cat)
-            dataset = json.loads(gzip.GzipFile(os.path.join(self.base_path,cat,"frame_annotations.jgz"),"rb").read().decode("utf8"))
-            val_amt = int(len(dataset)*.03)
-            dataset = dataset[:-val_amt] if not val else dataset[-val_amt:]
-            self.total_num_data+=len(dataset)
-            for i,data in enumerate(dataset):
-                self.all_frame_names.append((data["sequence_name"],data["frame_number"]))
-                sequences[data["sequence_name"]].append(data)
-    
-        sorted_seq={}
-        for k,v in sequences.items():
-            sorted_seq[k]=sorted(sequences[k],key=lambda x:x["frame_number"])
-        #for k,v in sequences.items(): sequences[k]=v[:-(max(self.num_skip) if type(self.num_skip)==list else self.num_skip)*self.n_trgt]
-        self.seqs = sorted_seq
-
-        print("done with dataloader init")
-
-
-
-    """
     def __init__(
         self,
         num_context=3,
@@ -231,7 +157,9 @@ class FlowCamDataset(torch.utils.data.Dataset):
         low_res=(128, 128),
         depth_scale=1,
         val=False,
-        base_path=r'C:\Users\rymi\work\FlowCam\underwater\0',
+        image_path=r'C:\Users\rymi\work\FlowCam\underwater\0',
+        pose_path=r'C:\Users\rymi\work\FlowCam\snapshoot269\data.sfm',
+        use_pose=True
     ):
         """
         Custom initialization for underwater dataset without frame annotations.
@@ -250,233 +178,155 @@ class FlowCamDataset(torch.utils.data.Dataset):
         self.low_res = low_res
         self.depth_scale = depth_scale
         self.val = val
-        self.base_path = base_path
+        self.image_path = image_path
+        self.pose_path = pose_path
+        self.use_pose = use_pose
 
         # Get all image paths
         self.image_files = sorted(
-            [os.path.join(base_path, f) for f in os.listdir(base_path) if f.endswith(('.png', '.jpg', '.jpeg'))]
+            [os.path.join(image_path, f) for f in os.listdir(image_path) if f.endswith(('.png', '.jpg', '.jpeg'))]
         )
         if len(self.image_files) < num_context + num_trgt:
             raise ValueError("Not enough images in the dataset to form context and target frames.")
+        
+        self.poses = self.parse_poses(self.pose_path)
 
         # Total number of usable sequences (adjust for context and target frames)
         self.total_num_data = len(self.image_files) - (num_context + num_trgt - 1) * n_skip
 
-        print(f"Initialized dataset with {self.total_num_data} sequences from {base_path}.")
-
-    def sparsify(self, dict, sparsity):
-        new_dict = {}
-        if sparsity is None:
-            return dict
-        else:
-            # Sample upper_limit pixel idcs at random.
-            rand_idcs = np.random.choice(
-                self.img_sidelength ** 2, size=sparsity, replace=False
-            )
-            for key in ["rgb", "uv"]:
-                new_dict[key] = dict[key][rand_idcs]
-
-            for key, v in dict.items():
-                if key not in ["rgb", "uv"]:
-                    new_dict[key] = dict[key]
-
-            return new_dict
-
-    def set_img_sidelength(self, new_img_sidelength):
-        """For multi-resolution training: Updates the image sidelength with which images are loaded."""
-        self.img_sidelength = new_img_sidelength
-        for instance in self.all_instances:
-            instance.set_img_sidelength(new_img_sidelength)
-
+        print(f"Initialized dataset with {self.total_num_data} sequences from {image_path}.")
+    
     def __len__(self):
         return self.total_num_data
-
-    def collate_fn(self, batch_list):
-        keys = batch_list[0].keys()
-        result = defaultdict(list)
-
-        for entry in batch_list:
-            # make them all into a new dict
-            for key in keys:
-                result[key].append(entry[key])
-
-        for key in keys:
-            try:
-                result[key] = torch.stack(result[key], dim=0)
-            except:
-                continue
-
-        return result
-    """
-    def __getitem__(self, idx,seq_query=None):
-
-        context = []
-        trgt = []
-        post_input = []
-
-        n_skip = (random.choice(self.num_skip) if type(self.num_skip)==list else self.num_skip) + 1
-
-        if seq_query is None:
-            try: 
-                seq_name,frame_idx=self.all_frame_names[idx]
-            except: 
-                print(f"Out of bounds erorr at {idx}. Investigate.")
-                return self[-2*n_skip*self.n_trgt if self.val else np.random.randint(len(self))]
+    
+    def correct_path(self, parsed_json):
+        """
+        Correct the paths in the given parsed JSON object by replacing incorrect segments.
         
-        if seq_query is not None:
-            frame_idx=idx
-            seq_name = list(self.seqs.keys())[seq_query]
-            all_frames= self.seqs[seq_name]
-        else:
-            all_frames=self.seqs[seq_name] if not self.of else self.seqs[random.choice(list(self.seqs.keys())[:int(self.of)])]
+        Args:
+            parsed_json (dict): JSON object parsed from the data.sfm file.
+        """
+        incorrect_path_segment = "ybr\\Desktop"
+        correct_path_segment = "rymi\\work\\FlowCam"
 
-        if len(all_frames)<=self.n_trgt*n_skip or frame_idx >= (len(all_frames)-self.n_trgt*n_skip):
-            frame_idx=0
-            if len(all_frames)<=self.n_trgt*n_skip or frame_idx >= (len(all_frames)-self.n_trgt*n_skip):
-                if len(all_frames)<=self.n_trgt*n_skip:
-                    print(len(all_frames) ," frames < ",self.n_trgt*n_skip," queries")
-                print("returning low/high")
-                return self[-2*n_skip*self.n_trgt if self.val else np.random.randint(len(self))]
-        start_idx = frame_idx 
+        # Update the paths in the 'views' section
+        for view in parsed_json["views"]:
+            old_path = view["path"]
+            new_path = old_path.replace(incorrect_path_segment, correct_path_segment)
+            view["path"] = new_path
 
-        if self.of and 1: start_idx=0
+    def parse_poses(self, pose_path):
+        """
+        Parse poses from the given pose file and apply path correction.
 
-        frames = all_frames[start_idx:start_idx+self.n_trgt*n_skip:n_skip]
-        if np.random.rand()<.5 and not self.of and not self.val: frames=frames[::-1]
+        Args:
+            pose_path (str): Path to the data.sfm file.
 
-        paths = [os.path.join(self.base_path,x["image"]["path"]) for x in frames]
-        for path in paths:
-            if not os.path.exists(path):
-                print("path missing")
-                return self[np.random.randint(len(self))]
+        Returns:
+            dict: Mapping of timestamps to SE(3) matrices (flattened).
+        """
+        with open(pose_path, 'r') as f:
+            parsed_json = json.load(f)
 
-        #masks=[torch.from_numpy(plt.imread(os.path.join(self.base_path,x["mask"]["path"]))) for x in frames]
-        imgs=[torch.from_numpy(plt.imread(path)) for path in paths]
+        # Correct paths in the JSON object
+        self.correct_path(parsed_json)
 
-        Ks=[]
-        c2ws=[]
-        depths=[]
-        for data in frames:
+        parsed_poses = {}
+        pose_dict = {pose['poseId']: pose['pose'] for pose in parsed_json['poses']}
+        for i, view in enumerate(parsed_json['views']):
+            timestamp = self.extract_timestamp(view['path'])
+            pose_id = view['poseId']
+            if pose_id in pose_dict:
+                rotation_matrix = np.array(pose_dict[pose_id]['transform']['rotation']).reshape(3, 3)
+                translation = np.array(pose_dict[pose_id]['transform']['center']).reshape(3)
+                se3_matrix = np.eye(4)
+                se3_matrix[:3, :3] = rotation_matrix
+                se3_matrix[:3, 3] = translation
 
-            #depths.append(torch.from_numpy(_load_depth(os.path.join(self.base_path,data["depth"]["path"]), data["depth"]["scale_adjustment"])[0])) # commenting out since slow to load; uncomment when needed
+                # Log SE(3) matrix for debugging
+                # print(f"Pose ID: {pose_id}")
+                # print(f"SE(3) Matrix from parse_poses:\n{se3_matrix}\n")
+                parsed_poses[timestamp] = se3_matrix.flatten().tolist()
+        return parsed_poses
 
-            # Below pose processing taken from co3d github issue
-            p = data["viewpoint"]["principal_point"]
-            f = data["viewpoint"]["focal_length"]
-            h, w = data["image"]["size"]
-            K = np.eye(3)
-            s = (min(h, w)) / 2
-            K[0, 0] = f[0] * (w) / 2
-            K[1, 1] = f[1] * (h) / 2
-            K[0, 2] = -p[0] * s + (w) / 2
-            K[1, 2] = -p[1] * s + (h) / 2
+    def extract_timestamp(self, path):
+        filename = path.split("\\")[-1]
+        timestamp_str = filename.split("D")[1].split(".")[0]  # Extract the timestamp part
+        date_part, time_part = timestamp_str.split("T")
+        time_part = time_part.replace("-", ":", 2).replace("-", ".")  # Fix separators
+        dt = datetime.datetime.strptime(f"{date_part}T{time_part}", "%Y-%m-%dT%H:%M:%S.%f")
+        return dt.replace(tzinfo=datetime.timezone.utc)  # Attach UTC timezone    
 
-            # Normalize intrinsics to [-1,1]
-            #print(K)
-            raw_K=[torch.from_numpy(K).clone(),[h,w]]
-            K[:2] /= torch.tensor([w, h])[:, None]
-            Ks.append(torch.from_numpy(K).float())
-
-            R = np.asarray(data["viewpoint"]["R"]).T   # note the transpose here
-            T = np.asarray(data["viewpoint"]["T"]) * self.depth_scale
-            pose = np.concatenate([R,T[:,None]],1)
-            pose = torch.from_numpy( np.diag([-1,-1,1]).astype(np.float32) @ pose )# flip the direction of x,y axis
-            tmp=torch.eye(4)
-            tmp[:3,:4]=pose
-            c2ws.append(tmp.inverse())
-
-        Ks=torch.stack(Ks)
-        c2w=torch.stack(c2ws).float()
-
-        no_mask=0
-        if no_mask:
-            masks=[x*0+1 for x in masks]
-
-        low_res=self.low_res#(128,144)#(108,144)
-        minx,miny=min([x.size(0) for x in imgs]),min([x.size(1) for x in imgs])
-
-        imgs=[x[:minx,:miny].float() for x in imgs]
-
-        if self.use_mask: # mask images and depths
-            imgs = [x*y.unsqueeze(-1)+(255*(1-y).unsqueeze(-1)) for x,y in zip(imgs,masks)]
-            depths = [x*y for x,y in zip(depths,masks)]
-
-        large_scale=2
-        imgs_large = F.interpolate(torch.stack([x.permute(2,0,1) for x in imgs]),
-                                  (int(256*large_scale),int(288*large_scale)),
-                                  antialias=True,mode="bilinear")
-        imgs_med = F.interpolate(torch.stack([x.permute(2,0,1) for x in imgs]),(int(256),int(288)),antialias=True,mode="bilinear")
-        imgs = F.interpolate(torch.stack([x.permute(2,0,1) for x in imgs]),low_res,antialias=True,mode="bilinear")
-
-        if self.use_mask:
-            imgs = imgs*masks[:,None]+255*(1-masks[:,None])
-
-        imgs = imgs/255 * 2 - 1
-
-        uv = np.mgrid[0:low_res[0], 0:low_res[1]].astype(float).transpose(1, 2, 0)
-        uv = torch.from_numpy(np.flip(uv, axis=-1).copy()).long()
-        uv = uv/ torch.tensor([low_res[1]-1, low_res[0]-1])  # uv in [0,1]
-        uv = uv[None].expand(len(imgs),-1,-1,-1).flatten(1,2)
-
-        model_input = {
-                "trgt_rgb": imgs[1:],
-                "ctxt_rgb": imgs[:-1],
-                "trgt_rgb_large": imgs_large[1:],
-                "ctxt_rgb_large": imgs_large[:-1],
-                "trgt_rgb_med": imgs_med[1:],
-                "ctxt_rgb_med": imgs_med[:-1],
-                #"ctxt_depth": depths.squeeze(1)[:-1],
-                #"trgt_depth": depths.squeeze(1)[1:],
-                "intrinsics": Ks[1:],
-                "trgt_c2w": c2w[1:],
-                "ctxt_c2w": c2w[:-1],
-                "x_pix": uv[1:],
-                #"trgt_mask": masks[1:],
-                #"ctxt_mask": masks[:-1],
-                }
-
-        gt = {
-                #"paths": paths,
-                #"raw_K": raw_K,
-                #"seq_name": seq_name,
-                "trgt_rgb": ch_sec(imgs[1:])*.5+.5,
-                "ctxt_rgb": ch_sec(imgs[:-1])*.5+.5,
-                #"ctxt_depth": depths.squeeze(1)[:-1].flatten(1,2).unsqueeze(-1),
-                #"trgt_depth": depths.squeeze(1)[1:].flatten(1,2).unsqueeze(-1),
-                "intrinsics": Ks[1:],
-                "x_pix": uv[1:],
-                #"seq_name": [seq_name],
-                #"trgt_mask": masks[1:].flatten(1,2).unsqueeze(-1),
-                #"ctxt_mask": masks[:-1].flatten(1,2).unsqueeze(-1),
-                }
-
-        return model_input,gt
-    """
     # Modify __getitem__ to directly load underwater images
     def __getitem__(self, idx):
-        image_dir = r'C:\Users\rymi\work\FlowCam\underwater\0'
+        image_dir = self.image_path
         image_files = sorted(os.listdir(image_dir))
         
         if idx >= len(image_files) - self.n_trgt:
             idx = random.randint(0, len(image_files) - self.n_trgt - 1)
 
-
         # Load target and context images
         imgs = []
+        c2w_matrices = []  # Store the c2w matrices for the sequence
         for i in range(self.n_trgt + 1):
             img_path = os.path.join(image_dir, image_files[idx + i])
             img = plt.imread(img_path)
             imgs.append(torch.from_numpy(np.copy(img)).float())  # Copy to ensure writability
+            
+            # Extract timestamp from image path and get the corresponding c2w matrix
+            timestamp = self.extract_timestamp(img_path)
+            if timestamp in self.poses:
+                c2w_matrix = torch.tensor(self.poses[timestamp]).view(4, 4).float()
+                # print(f"Image Index: {idx + i}")
+                # print(f"Timestamp: {timestamp}")
+                # print(f"Target Pose Matrix (c2w):\n{c2w_matrix}")
+            else:
+                print(f"Warning: No pose found for timestamp {timestamp}. Defaulting to identity.")
+                #c2w_matrix = torch.eye(4)
+            c2w_matrices.append(c2w_matrix)
 
-        # Mock intrinsics and poses
-        h, w = self.low_res
-        K = np.eye(3)  # Initialize as an identity matrix
-        K[0, 0] = K[1, 1] = max(h, w) / 2  # Approximate focal length
-        K[0, 2] = w / 2  # Principal point x-coordinate
-        K[1, 2] = h / 2  # Principal point y-coordinate
-        Ks = torch.from_numpy(K).float().unsqueeze(0).repeat(len(imgs), 1, 1)
-        print(f"h = {h}, w = {w}")
+        c2w_matrices = torch.stack(c2w_matrices)  # Stack into a tensor
+
+        # Split into target and context matrices
+        trgt_c2w = c2w_matrices[1:]
+        ctxt_c2w = c2w_matrices[:-1]
+        #print(f"Target Pose Matrix (c2w):\n{trgt_c2w}")
+        #print(f"Context Pose Matrix (c2w):\n{ctxt_c2w}")
+
+        # Load YAML file
+        with open("C:\\Users\\rymi\\work\\FlowCam\\snapshoot269\\AIDataloader.yml", "r") as file:
+            config = yaml.safe_load(file)
+        
+        # Extract camera parameters
+        camera_params = config["camera_params"]
+        image_size = config["image_size"]
+
+        # print(f"camera_params = {camera_params}")
+        # print(f"image_size = {image_size}")
+
+        focal_length_x = camera_params["focal_length_x"]
+        focal_length_y = camera_params["focal_length_y"]
+        principal_point_x = image_size["width"] / 2
+        principal_point_y = image_size["height"] / 2
+
+        # Construct intrinsic matrix
+        K = np.eye(3)
+        K[0, 0] = focal_length_x
+        K[1, 1] = focal_length_y
+        K[0, 2] = principal_point_x
+        K[1, 2] = principal_point_y
+
+        # Normalize intrinsics based on image size
+        K_normalized = K.copy()
+        K_normalized[0, :] /= image_size["width"]
+        K_normalized[1, :] /= image_size["height"]
+
+        # Expand to have a batch dimension and repeat the matrix for each frame in the batch.
+        intrinsics_normalized = torch.from_numpy(K_normalized).float().unsqueeze(0).repeat(len(imgs), 1, 1)
+
+        # Increase img resolution for RAFT
         low_res=self.low_res
+        h, w = low_res # (320, 320)
         large_scale=2
         imgs_large = F.interpolate(
             torch.stack([x.permute(2, 0, 1) for x in imgs]),
@@ -507,17 +357,15 @@ class FlowCamDataset(torch.utils.data.Dataset):
             "ctxt_rgb": imgs[:-1],
             "trgt_rgb_large": imgs_large[1:],
             "ctxt_rgb_large": imgs_large[:-1],
-            "intrinsics": Ks[1:],
-            #"trgt_c2w": c2w[1:],
-            #"ctxt_c2w": c2w[:-1],
+            "trgt_c2w": trgt_c2w,
+            "ctxt_c2w": ctxt_c2w,
+            "intrinsics": intrinsics_normalized[1:],
             "x_pix": uv[1:],
         }
         gt = {
-            # "trgt_rgb": imgs[1:], 
-            # "ctxt_rgb": imgs[:-1],
             "trgt_rgb": ch_sec(imgs[1:])*.5+.5,
             "ctxt_rgb": ch_sec(imgs[:-1])*.5+.5,
-            "intrinsics": Ks[1:],
+            "intrinsics": intrinsics_normalized[1:],
             "x_pix": uv[1:],
         }
 
