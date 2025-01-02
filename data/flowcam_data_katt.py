@@ -192,10 +192,10 @@ class FlowCamDataset(torch.utils.data.Dataset):
         # Parse images and poses once during initialization
         self.images_by_timestamp = self.parse_timestamps_and_images(self.image_path, self.pose_path)
         self.poses_by_timestamp = self.parse_poses(self.pose_path)
-        # self.landmarks = self.parse_landmarks(self.pose_path)
+        #self.landmarks = self.parse_landmarks(self.pose_path)
 
-        # print(f"Extracted {len(self.landmarks)} landmarks.")
-        # print(self.landmarks[5])  # Print the first landmark to check
+        ##print(f"Extracted {len(self.landmarks)} landmarks.")
+        #print(self.landmarks[5])  # Print the first landmark to check
 
         # Get all sorted timestamps
         self.sorted_timestamps = sorted(self.images_by_timestamp.keys())
@@ -204,7 +204,6 @@ class FlowCamDataset(torch.utils.data.Dataset):
         self.total_num_data = len(self.image_files) - (num_context + num_trgt - 1) * n_skip
 
         print(f"Initialized dataset with {self.total_num_data} sequences from {image_path}.")
-        print(f"Number of timestamps: {len(self.sorted_timestamps)}")
     
     def __len__(self):
         return self.total_num_data
@@ -241,6 +240,7 @@ class FlowCamDataset(torch.utils.data.Dataset):
         
         return landmarks
 
+
     def correct_path(self, parsed_json):
         """
         Correct the paths in the given parsed JSON object by replacing incorrect segments.
@@ -248,19 +248,28 @@ class FlowCamDataset(torch.utils.data.Dataset):
         Args:
             parsed_json (dict): JSON object parsed from the data.sfm file.
         """
-        incorrect_path_segment = "ybr\\Desktop"
-        correct_path_segment = "rymi\\work\\FlowCam"
-        #incorrect_path_segment = "data\\unittest\\test\\CppTestML\\ALL\\"
-        #correct_path_segment = "Users\\rymi\\work\\FlowCam\\deep_ocean_pipe\\"
-        # Update the paths in the 'views' section
+        def to_forward_slashes(path):
+            return path.replace("\\", "/").replace("\\/", "/")
+        
+        incorrect_fragment_fwd = "C:/data/Kattegat Center Videos BlueROV-27-09-2021/20210927121113492-CH0 ROV Camera Feed/snapshoot245"
+        correct_fragment_fwd = "C:/Users/rymi/work/FlowCam/kattegat"
+
         for view in parsed_json["views"]:
             old_path = view["path"]
-            new_path = old_path.replace(incorrect_path_segment, correct_path_segment)
+            old_path_fwd = to_forward_slashes(old_path)
+
+            # b) Replace the fragment:
+            new_path_fwd = old_path_fwd.replace(incorrect_fragment_fwd, correct_fragment_fwd)
+
+            # c) (Optional) convert back to backslashes:
+            #    "C:\Users\rymi\work\FlowCam\kattegat\Images\0\D2021..."
+            #    If you prefer forward slashes, you can skip this step.
+            new_path = new_path_fwd.replace("/", "\\")
+
             view["path"] = new_path
-
-        # print(f"Old path: {old_path}")
-
-        # print(f"New path: {new_path}")
+            #print(f"Old path: {old_path}")
+            #print(f"New path: {view['path']}")
+            #print("-----")
 
     def parse_poses(self, pose_path):
         """
@@ -322,6 +331,7 @@ class FlowCamDataset(torch.utils.data.Dataset):
 
     # Modify __getitem__ to directly load underwater images
     def __getitem__(self, idx):
+        print(f"Number of timestamps: {len(self.sorted_timestamps)}")
 
         if idx >= len(self.sorted_timestamps) - self.n_trgt:
             idx = random.randint(0, len(self.sorted_timestamps) - self.n_trgt - 1)
@@ -361,15 +371,15 @@ class FlowCamDataset(torch.utils.data.Dataset):
         
         # Extract camera parameters
         camera_params = config["camera_params"]
-        image_size = config["image_size"]
+        image_size = (1920,1080)
 
         # print(f"camera_params = {camera_params}")
         # print(f"image_size = {image_size}")
 
         focal_length_x = camera_params["focal_length_x"]
         focal_length_y = camera_params["focal_length_y"]
-        principal_point_x = image_size["width"] / 2
-        principal_point_y = image_size["height"] / 2
+        principal_point_x = image_size[0] / 2
+        principal_point_y = image_size[1] / 2
 
         # Construct intrinsic matrix
         K = np.eye(3)
@@ -380,8 +390,8 @@ class FlowCamDataset(torch.utils.data.Dataset):
 
         # Normalize intrinsics based on image size
         K_normalized = K.copy()
-        K_normalized[0, :] /= image_size["width"]
-        K_normalized[1, :] /= image_size["height"]
+        K_normalized[0, :] /= image_size[0]
+        K_normalized[1, :] /= image_size[1]
 
         # Expand to have a batch dimension and repeat the matrix for each frame in the batch.
         intrinsics_normalized = torch.from_numpy(K_normalized).float().unsqueeze(0).repeat(len(imgs), 1, 1)

@@ -157,7 +157,7 @@ class FlowCamDataset(torch.utils.data.Dataset):
         low_res=(128, 128),
         depth_scale=1,
         val=False,
-        image_path=r'C:\Users\rymi\work\FlowCam\underwater\0',
+        image_path=r'C:\Users\rymi\work\FlowCam\snapshoot269\Images\0',
         pose_path=r'C:\Users\rymi\work\FlowCam\snapshoot269\data.sfm',
         use_pose=True
     ):
@@ -190,12 +190,9 @@ class FlowCamDataset(torch.utils.data.Dataset):
             raise ValueError("Not enough images in the dataset to form context and target frames.")
 
         # Parse images and poses once during initialization
-        self.images_by_timestamp = self.parse_timestamps_and_images(self.image_path, self.pose_path)
-        self.poses_by_timestamp = self.parse_poses(self.pose_path)
-        # self.landmarks = self.parse_landmarks(self.pose_path)
-
-        # print(f"Extracted {len(self.landmarks)} landmarks.")
-        # print(self.landmarks[5])  # Print the first landmark to check
+        valid_view_ids = set(range(713))  # 0 to 712 inclusive
+        self.images_by_timestamp = self.parse_timestamps_and_images(self.image_path, self.pose_path, valid_view_ids)
+        self.poses_by_timestamp = self.parse_poses(self.pose_path, valid_view_ids)
 
         # Get all sorted timestamps
         self.sorted_timestamps = sorted(self.images_by_timestamp.keys())
@@ -205,69 +202,49 @@ class FlowCamDataset(torch.utils.data.Dataset):
 
         print(f"Initialized dataset with {self.total_num_data} sequences from {image_path}.")
         print(f"Number of timestamps: {len(self.sorted_timestamps)}")
+
+        # Debugging: Print sorted timestamps
+        print("Sorted timestamps:")
+        for idx, ts in enumerate(self.sorted_timestamps):
+            print(f"{idx}: {ts}")
+
     
     def __len__(self):
         return self.total_num_data
 
-    def parse_landmarks(self, pose_path):
-        """
-        Parse the data.sfm file to extract landmarks and their 2D observations.
-        
-        Args:
-            sfm_path (str): Path to the data.sfm file.
-
-        Returns:
-            landmarks (list): List of dictionaries containing 3D points and 2D observations.
-        """
-        with open(pose_path, 'r') as f:
-            sfm_data = json.load(f)
-        
-        landmarks = []
-        
-        for landmark in sfm_data["structure"]:
-            landmark_id = int(landmark["landmarkId"])
-            X = np.array([float(coord) for coord in landmark["X"]])  # 3D landmark coordinates
-            
-            observations = []
-            for obs in landmark["observations"]:
-                x = np.array([float(coord) for coord in obs["x"]])  # 2D image coordinates
-                observations.append(x)
-            
-            landmarks.append({
-                "id": landmark_id,
-                "X": X,
-                "observations": observations
-            })
-        
-        return landmarks
-
     def correct_path(self, parsed_json):
         """
         Correct the paths in the given parsed JSON object by replacing incorrect segments.
-        
+
         Args:
             parsed_json (dict): JSON object parsed from the data.sfm file.
         """
-        incorrect_path_segment = "ybr\\Desktop"
-        correct_path_segment = "rymi\\work\\FlowCam"
-        #incorrect_path_segment = "data\\unittest\\test\\CppTestML\\ALL\\"
-        #correct_path_segment = "Users\\rymi\\work\\FlowCam\\deep_ocean_pipe\\"
-        # Update the paths in the 'views' section
+        def to_forward_slashes(path):
+            return path.replace("\\", "/").replace("\\/", "/")
+    
+        incorrect_fragment_fwd = "C:/data/unittest/test/CppTestML/ALL"
+        correct_fragment_fwd = "C:/Users/rymi/work/FlowCam/deep_ocean_pipe"
+        
         for view in parsed_json["views"]:
             old_path = view["path"]
-            new_path = old_path.replace(incorrect_path_segment, correct_path_segment)
+            old_path_fwd = to_forward_slashes(old_path)
+
+            new_path_fwd = old_path_fwd.replace(incorrect_fragment_fwd, correct_fragment_fwd)
+            new_path = new_path_fwd.replace("/", "\\")
+
             view["path"] = new_path
+            # print(f"Old path: {old_path}")
+            # print(f"New path: {view['path']}")
+            # print("-----")
 
-        # print(f"Old path: {old_path}")
-
-        # print(f"New path: {new_path}")
-
-    def parse_poses(self, pose_path):
+    def parse_poses(self, pose_path, valid_view_ids=None, valid_subfolder="Images\\0\\"):
         """
         Parse poses from the given pose file and apply path correction.
 
         Args:
             pose_path (str): Path to the data.sfm file.
+            valid_view_ids (set): Valid view IDs to filter.
+            valid_subfolder (str): Subfolder to filter poses (default is "Images\0").
 
         Returns:
             dict: Mapping of timestamps to SE(3) matrices (flattened).
@@ -280,45 +257,98 @@ class FlowCamDataset(torch.utils.data.Dataset):
 
         parsed_poses = {}
         pose_dict = {pose['poseId']: pose['pose'] for pose in parsed_json['poses']}
-        for i, view in enumerate(parsed_json['views']):
-            #print(f"Final corrected path: {view['path']}")
-            timestamp = self.extract_timestamp(view['path'])
-            pose_id = view['poseId']
-            if pose_id in pose_dict:
-                rotation_matrix = np.array(pose_dict[pose_id]['transform']['rotation']).reshape(3, 3)
-                translation = np.array(pose_dict[pose_id]['transform']['center']).reshape(3)
-                se3_matrix = np.eye(4)
-                se3_matrix[:3, :3] = rotation_matrix
-                se3_matrix[:3, 3] = translation
 
-                # Log SE(3) matrix for debugging
-                # print(f"Pose ID: {pose_id}")
-                # print(f"SE(3) Matrix from parse_poses:\n{se3_matrix}\n")
-                parsed_poses[timestamp] = se3_matrix.flatten().tolist()
-     
+        for view in parsed_json['views']:
+            view_id = int(view['viewId'])
+            view_path = view['path']
+
+            # Filter by valid view IDs and valid subfolder
+            if (valid_view_ids is None or view_id in valid_view_ids) and valid_subfolder in view_path:
+                try:
+                    timestamp = self.extract_timestamp(view_path)
+                    pose_id = view['poseId']
+                    if pose_id in pose_dict:
+                        rotation_matrix = np.array(pose_dict[pose_id]['transform']['rotation']).reshape(3, 3)
+                        translation = np.array(pose_dict[pose_id]['transform']['center']).reshape(3)
+                        se3_matrix = np.eye(4)
+                        se3_matrix[:3, :3] = rotation_matrix
+                        se3_matrix[:3, 3] = translation
+
+                        parsed_poses[timestamp] = se3_matrix.flatten().tolist()
+                except Exception as e:
+                    print(f"Skipping view due to error in extracting timestamp or pose: {view_path} | Error: {e}")
+                    continue
+
         return parsed_poses
 
-    def parse_timestamps_and_images(self, image_path, pose_path):
-        data_file = pose_path
-        with open(data_file, 'r') as f:
+    def parse_timestamps_and_images(self, image_path, pose_path, valid_view_ids=None, valid_subfolder="Images\\0\\"):
+        """
+        Parse timestamps and image paths from the given pose file, filtering by valid view IDs and subfolder.
+
+        Args:
+            image_path (str): Path to the image directory.
+            pose_path (str): Path to the data.sfm file.
+            valid_view_ids (set): Valid view IDs to filter.
+            valid_subfolder (str): Subfolder to filter images (default is "Images\0").
+
+        Returns:
+            dict: Mapping of timestamps to image paths.
+        """
+        with open(pose_path, 'r') as f:
             parsed_json = json.load(f)
+
+        # Correct paths in the JSON object
+        self.correct_path(parsed_json)
 
         parsed_images = {}
         for view in parsed_json['views']:
-            timestamp = self.extract_timestamp(view['path'])
+            view_id = int(view['viewId'])
             view_path = view['path']
-            # take only file name from view_path
-            view_file = view_path.split("\\")[-1]
-            parsed_images[timestamp] = os.path.join(image_path, view_file)
+
+            # Filter by valid view IDs and valid subfolder
+            if (valid_view_ids is None or view_id in valid_view_ids) and valid_subfolder in view_path:
+                try:
+                    timestamp = self.extract_timestamp(view_path)
+                    # Take only the file name from view_path
+                    view_file = view_path.split("\\")[-1]
+                    parsed_images[timestamp] = os.path.join(image_path, view_file)
+                except Exception as e:
+                    print(f"Skipping view due to error in extracting timestamp: {view_path} | Error: {e}")
+                    continue
+
         return parsed_images
 
     def extract_timestamp(self, path):
-        filename = path.split("\\")[-1]
-        timestamp_str = filename.split("D")[1].split(".")[0]  # Extract the timestamp part
-        date_part, time_part = timestamp_str.split("T")
-        time_part = time_part.replace("-", ":", 2).replace("-", ".")  # Fix separators
-        dt = datetime.datetime.strptime(f"{date_part}T{time_part}", "%Y-%m-%dT%H:%M:%S.%f")
-        return dt.replace(tzinfo=datetime.timezone.utc)  # Attach UTC timezone    
+        """
+        Extract timestamp from the filename. Expected format: MM-DD-HHmmss.SSS.jpg
+
+        Args:
+            path (str): File path.
+
+        Returns:
+            datetime: Parsed timestamp with sub-second precision.
+        """
+        filename = path.split("\\")[-1]  # Extract the filename
+        try:
+            # Extract the timestamp part (e.g., '03-08-17105757.760' from the full filename)
+            timestamp_str = filename.rsplit(".", 1)[0]  # Removes '.jpg', retains '.SSS'
+            date_part = timestamp_str[:5]  # MM-DD
+            time_part = timestamp_str[6:]  # HHmmss.SSS
+
+            # Debugging: Print full extracted timestamp parts
+            # print(f"Full timestamp string: {timestamp_str}")
+            # print(f"Date part: {date_part}")
+            # print(f"Time part: {time_part}")
+
+            # Combine date and time parts into a single timestamp
+            full_timestamp = f"{date_part}T{time_part}"
+            #print(f"Combined full timestamp: {full_timestamp}")  # Debugging
+
+            return full_timestamp
+        except ValueError as e:
+            print(f"Error parsing timestamp from filename: {filename} | Error: {e}")
+            raise
+
 
     # Modify __getitem__ to directly load underwater images
     def __getitem__(self, idx):
@@ -356,20 +386,21 @@ class FlowCamDataset(torch.utils.data.Dataset):
         #print(f"Context Pose Matrix (c2w):\n{ctxt_c2w}")
 
         # Load YAML file
-        with open("C:\\Users\\rymi\\work\\FlowCam\\snapshoot269\\AIDataloader.yml", "r") as file:
+        with open("C:\\Users\\rymi\\work\\FlowCam\\deep_ocean_pipe\\0.yml", "r") as file:
             config = yaml.safe_load(file)
         
         # Extract camera parameters
         camera_params = config["camera_params"]
-        image_size = config["image_size"]
+        image_size = (960,540)
 
         # print(f"camera_params = {camera_params}")
-        # print(f"image_size = {image_size}")
+        # print(f"image width = {image_size[0]}")
+        # print(f"image height = {image_size[1]}")
 
         focal_length_x = camera_params["focal_length_x"]
         focal_length_y = camera_params["focal_length_y"]
-        principal_point_x = image_size["width"] / 2
-        principal_point_y = image_size["height"] / 2
+        principal_point_x = image_size[0] / 2
+        principal_point_y = image_size[1] / 2
 
         # Construct intrinsic matrix
         K = np.eye(3)
@@ -380,8 +411,8 @@ class FlowCamDataset(torch.utils.data.Dataset):
 
         # Normalize intrinsics based on image size
         K_normalized = K.copy()
-        K_normalized[0, :] /= image_size["width"]
-        K_normalized[1, :] /= image_size["height"]
+        K_normalized[0, :] /= image_size[0]
+        K_normalized[1, :] /= image_size[1]
 
         # Expand to have a batch dimension and repeat the matrix for each frame in the batch.
         intrinsics_normalized = torch.from_numpy(K_normalized).float().unsqueeze(0).repeat(len(imgs), 1, 1)
